@@ -17,6 +17,7 @@ from threading import RLock
 from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -1082,9 +1083,17 @@ class TickFlowFetcher(BaseFetcher):
             "flat_count": 0,
             "limit_up_count": 0,
             "limit_down_count": 0,
+            "limit_up_20pct_count": 0,
             "total_amount": 0.0,
+            "median_change_pct": 0.0,
+            "limit_up_down_ratio": 0.0,
+            "lookback_10pct_count": 0,
+            "avg_stock_price": 0.0,
         }
         valid_rows = 0
+        change_pcts = []
+        total_price = 0.0
+        price_count = 0
 
         for quote in quotes:
             if not quote:
@@ -1101,6 +1110,7 @@ class TickFlowFetcher(BaseFetcher):
             pure_code = normalize_stock_code(symbol)
             last_price = self._safe_float(quote.get("last_price"))
             prev_close = self._safe_float(quote.get("prev_close"))
+            high_price = self._safe_float(quote.get("high"))
 
             if last_price is None or prev_close is None or amount is None or amount <= 0:
                 continue
@@ -1118,6 +1128,8 @@ class TickFlowFetcher(BaseFetcher):
 
             if abs(last_price - limit_up) <= limit_up_tolerance:
                 stats["limit_up_count"] += 1
+                if ratio == 0.20:
+                    stats["limit_up_20pct_count"] += 1
             if abs(last_price - limit_down) <= limit_down_tolerance:
                 stats["limit_down_count"] += 1
 
@@ -1128,9 +1140,39 @@ class TickFlowFetcher(BaseFetcher):
             else:
                 stats["flat_count"] += 1
 
+            # 计算涨跌幅用于中位数
+            if prev_close > 0:
+                pct = (last_price - prev_close) / prev_close * 100
+                change_pcts.append(pct)
+
+            # 平均股价
+            if last_price > 0:
+                total_price += last_price
+                price_count += 1
+
+            # 回头波大于10%
+            if prev_close > 0 and high_price is not None and high_price > prev_close * 1.10 and last_price < high_price:
+                drop_pct = (high_price - last_price) / prev_close * 100
+                if drop_pct > 10:
+                    stats["lookback_10pct_count"] += 1
+
         if valid_rows == 0:
             logger.warning("[TickFlowFetcher] no valid A-share rows for market stats")
             return None
+
+        # 中位数涨跌幅
+        if change_pcts:
+            stats["median_change_pct"] = float(np.median(change_pcts))
+
+        # 涨跌停比例
+        if stats["limit_down_count"] > 0:
+            stats["limit_up_down_ratio"] = round(stats["limit_up_count"] / stats["limit_down_count"], 2)
+        elif stats["limit_up_count"] > 0:
+            stats["limit_up_down_ratio"] = float('inf')
+
+        # 平均股价
+        if price_count > 0:
+            stats["avg_stock_price"] = round(total_price / price_count, 2)
 
         return stats
 

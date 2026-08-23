@@ -966,38 +966,44 @@ class TushareFetcher(BaseFetcher):
             import numpy as np
 
             df = df.copy()
-            
+
             # 1. 提取基础比对数据：最新价、昨收
             # 兼容不同接口返回的列名 sina/em efinance tushare xtdata
             code_col = next((c for c in ['代码', '股票代码', 'ts_code','stock_code'] if c in df.columns), None)
             name_col = next((c for c in ['名称', '股票名称','name','name'] if c in df.columns), None)
             close_col = next((c for c in ['最新价', '最新价', 'close','lastPrice'] if c in df.columns), None)
             pre_close_col = next((c for c in ['昨收', '昨日收盘', 'pre_close','lastClose'] if c in df.columns), None)
-            amount_col = next((c for c in ['成交额', '成交额', 'amount','amount'] if c in df.columns), None) 
-            
+            amount_col = next((c for c in ['成交额', '成交额', 'amount','amount'] if c in df.columns), None)
+            high_col = next((c for c in ['最高', '最高价', 'high'] if c in df.columns), None)
+
             limit_up_count = 0
             limit_down_count = 0
+            limit_up_20pct_count = 0
             up_count = 0
             down_count = 0
             flat_count = 0
+            lookback_10pct_count = 0
+            change_pcts = []
+            total_price = 0.0
+            price_count = 0
 
             for code, name, current_price, pre_close, amount in zip(
                 df[code_col], df[name_col], df[close_col], df[pre_close_col], df[amount_col]
             ):
-                
+
                 # 停牌过滤 efinance 的停牌数据有时候会缺失价格显示为 '-'，em 显示为none
                 if pd.isna(current_price) or pd.isna(pre_close) or current_price in ['-'] or pre_close in ['-'] or amount == 0:
                     continue
-                
+
                 # em、efinance 为str 需要转换为float
                 current_price = float(current_price)
                 pre_close = float(pre_close)
-                
+
                 # 获取去除前缀的纯数字代码
-                pure_code = normalize_stock_code(str(code)) 
+                pure_code = normalize_stock_code(str(code))
 
                 # A. 确定每只股票的涨跌幅比例 (使用纯数字代码判断)
-                if is_bse_code(pure_code): 
+                if is_bse_code(pure_code):
                     ratio = 0.30
                 elif is_kc_cy_stock(pure_code): #pure_code.startswith(('688', '30')):
                     ratio = 0.20
@@ -1020,6 +1026,8 @@ class TushareFetcher(BaseFetcher):
 
                     if is_limit_up:
                         limit_up_count += 1
+                        if ratio == 0.20:
+                            limit_up_20pct_count += 1
                     if is_limit_down:
                         limit_down_count += 1
 
@@ -1029,7 +1037,35 @@ class TushareFetcher(BaseFetcher):
                         down_count += 1
                     else:
                         flat_count += 1
-                    
+
+                    # 计算涨跌幅用于中位数
+                    if pre_close > 0:
+                        pct = (current_price - pre_close) / pre_close * 100
+                        change_pcts.append(pct)
+
+                    # 平均股价
+                    if current_price > 0:
+                        total_price += current_price
+                        price_count += 1
+
+            # 回头波大于10%（从最高价回落超过10%）
+            if high_col and high_col in df.columns:
+                for high_price, current_price, pre_close in zip(
+                    df[high_col], df[close_col], df[pre_close_col]
+                ):
+                    if pd.isna(high_price) or pd.isna(current_price) or pd.isna(pre_close):
+                        continue
+                    try:
+                        high_price = float(high_price)
+                        current_price = float(current_price)
+                        pre_close = float(pre_close)
+                        if pre_close > 0 and high_price > pre_close * 1.10 and current_price < high_price:
+                            drop_pct = (high_price - current_price) / pre_close * 100
+                            if drop_pct > 10:
+                                lookback_10pct_count += 1
+                    except (ValueError, TypeError):
+                        continue
+
             # 统计数量
             stats = {
                 'up_count': up_count,
@@ -1037,14 +1073,33 @@ class TushareFetcher(BaseFetcher):
                 'flat_count': flat_count,
                 'limit_up_count': limit_up_count,
                 'limit_down_count': limit_down_count,
+                'limit_up_20pct_count': limit_up_20pct_count,
                 'total_amount': 0.0,
+                'median_change_pct': 0.0,
+                'limit_up_down_ratio': 0.0,
+                'lookback_10pct_count': lookback_10pct_count,
+                'avg_stock_price': 0.0,
             }
-            
+
+            # 中位数涨跌幅
+            if change_pcts:
+                stats['median_change_pct'] = float(np.median(change_pcts))
+
+            # 涨跌停比例
+            if limit_down_count > 0:
+                stats['limit_up_down_ratio'] = round(limit_up_count / limit_down_count, 2)
+            elif limit_up_count > 0:
+                stats['limit_up_down_ratio'] = float('inf')
+
+            # 平均股价
+            if price_count > 0:
+                stats['avg_stock_price'] = round(total_price / price_count, 2)
+
             # 成交额统计
             if amount_col and amount_col in df.columns:
                 df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
                 stats['total_amount'] = (df[amount_col].sum() / 1e8)
-                
+
             return stats
 
     def get_trade_time(self,early_time='09:30',late_time='16:30') -> Optional[str]:

@@ -99,9 +99,29 @@ class MarketOverview:
     flat_count: int = 0                 # 平盘家数
     limit_up_count: int = 0             # 涨停家数
     limit_down_count: int = 0           # 跌停家数
+    limit_up_20pct_count: int = 0       # 20%涨停板数（科创板/创业板）
+    break_count: int = 0                # 涨停炸板数
+    break_rate: float = 0.0             # 炸板率(%)
+    median_change_pct: float = 0.0      # 中位数涨跌幅(%)
+    limit_up_down_ratio: float = 0.0    # 涨跌停比例
+    lookback_10pct_count: int = 0       # 回头波大于10%数
+    consecutive_boards_count: int = 0   # 连板数（有连板的股票数量）
+    consecutive_boards_rate: float = 0.0 # 连板率(%)
+    highest_board_stock: str = ""       # 最高板代表股
+    highest_board_count: int = 0        # 最高板数
+    boards_2_to_max: int = 0            # 2板至最高板数量
     total_amount: float = 0.0           # 两市成交额（亿元）
     # north_flow: float = 0.0           # 北向资金净流入（亿元）- 已废弃，接口不可用
-    
+
+    # 融资融券
+    margin_sh: float = 0.0              # 上海融资融券余额（亿元）
+    margin_sz: float = 0.0              # 深圳融资融券余额（亿元）
+    margin_bj: float = 0.0              # 北京融资融券余额（亿元）
+    margin_total: float = 0.0           # 融资融券合计（亿元）
+
+    # 平均股价
+    avg_stock_price: float = 0.0        # 平均股价
+
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
@@ -552,13 +572,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
     def get_market_overview(self) -> MarketOverview:
         """
         获取市场概览数据
-        
+
         Returns:
             MarketOverview: 市场概览数据对象
         """
         today = datetime.now().strftime('%Y-%m-%d')
         overview = MarketOverview(date=today)
-        
+
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
         overview.indices = self._get_main_indices()
 
@@ -566,14 +586,18 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if self.profile.has_market_stats:
             self._get_market_statistics(overview)
 
-        # 3. 获取板块涨跌榜（A 股有，美股暂无）
+        # 3. 获取融资融券余额（A 股）
+        if self.profile.has_market_stats:
+            self._get_margin_balance(overview)
+
+        # 4. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
             self._get_concept_rankings(overview)
-        
-        # 4. 获取北向资金（可选）
+
+        # 5. 获取北向资金（可选）
         # self._get_north_flow(overview)
-        
+
         return overview
 
     
@@ -632,17 +656,34 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 overview.flat_count = stats.get('flat_count', 0)
                 overview.limit_up_count = stats.get('limit_up_count', 0)
                 overview.limit_down_count = stats.get('limit_down_count', 0)
+                overview.limit_up_20pct_count = stats.get('limit_up_20pct_count', 0)
+                overview.break_count = stats.get('break_count', 0)
+                overview.break_rate = stats.get('break_rate', 0.0)
+                overview.median_change_pct = stats.get('median_change_pct', 0.0)
+                overview.limit_up_down_ratio = stats.get('limit_up_down_ratio', 0.0)
+                overview.lookback_10pct_count = stats.get('lookback_10pct_count', 0)
+                overview.consecutive_boards_count = stats.get('consecutive_boards_count', 0)
+                overview.consecutive_boards_rate = stats.get('consecutive_boards_rate', 0.0)
+                overview.highest_board_stock = stats.get('highest_board_stock', "")
+                overview.highest_board_count = stats.get('highest_board_count', 0)
+                overview.boards_2_to_max = stats.get('boards_2_to_max', 0)
                 overview.total_amount = stats.get('total_amount', 0.0)
+                overview.avg_stock_price = stats.get('avg_stock_price', 0.0)
 
                 logger.info(
                     "[大盘] %s action=get_market_stats status=success up=%s down=%s flat=%s "
-                    "limit_up=%s limit_down=%s amount=%.0f亿",
+                    "limit_up=%s limit_down=%s limit_up_20pct=%s break=%s break_rate=%.1f%% "
+                    "median=%.2f%% amount=%.0f亿",
                     self._log_context(),
                     overview.up_count,
                     overview.down_count,
                     overview.flat_count,
                     overview.limit_up_count,
                     overview.limit_down_count,
+                    overview.limit_up_20pct_count,
+                    overview.break_count,
+                    overview.break_rate,
+                    overview.median_change_pct,
                     overview.total_amount,
                 )
             else:
@@ -650,6 +691,33 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.error("[大盘] %s action=get_market_stats status=failed error=%s", self._log_context(), e)
+
+    def _get_margin_balance(self, overview: MarketOverview):
+        """获取融资融券余额"""
+        try:
+            logger.info("[大盘] %s action=get_margin_balance status=start", self._log_context())
+
+            margin_data = self.data_manager.get_margin_balance()
+            if margin_data:
+                overview.margin_sh = margin_data.get('sh', 0.0)
+                overview.margin_sz = margin_data.get('sz', 0.0)
+                overview.margin_bj = margin_data.get('bj', 0.0)
+                overview.margin_total = margin_data.get('total', 0.0)
+
+                logger.info(
+                    "[大盘] %s action=get_margin_balance status=success "
+                    "sh=%.0f sz=%.0f bj=%.0f total=%.0f亿",
+                    self._log_context(),
+                    overview.margin_sh,
+                    overview.margin_sz,
+                    overview.margin_bj,
+                    overview.margin_total,
+                )
+            else:
+                logger.warning("[大盘] %s action=get_margin_balance status=empty", self._log_context())
+
+        except Exception as e:
+            logger.error("[大盘] %s action=get_margin_balance status=failed error=%s", self._log_context(), e)
 
     def _get_sector_rankings(self, overview: MarketOverview):
         """获取板块涨跌榜"""
@@ -1244,9 +1312,22 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     "|------|------|------|",
                     f"| 上涨/下跌/平盘 | {overview.up_count} / {overview.down_count} / {overview.flat_count} | 上涨占比(不含平盘) {up_ratio:.1%} |",
                     f"| 涨停/跌停 | {overview.limit_up_count} / {overview.limit_down_count} | 涨跌停差 {limit_spread:+d} |",
+                    f"| 20%涨停 | {overview.limit_up_20pct_count} | 科创板/创业板 |",
+                    f"| 炸板数/炸板率 | {overview.break_count} / {overview.break_rate:.1f}% | 涨停后开板 |",
+                    f"| 中位数涨跌幅 | {overview.median_change_pct:+.2f}% | 市场整体涨跌中位 |",
+                    f"| 涨跌停比例 | {overview.limit_up_down_ratio:.2f} | 涨停数/跌停数 |",
+                    f"| 回头波>10% | {overview.lookback_10pct_count} | 日内冲高回落 |",
+                    f"| 连板数/连板率 | {overview.consecutive_boards_count} / {overview.consecutive_boards_rate:.1f}% | 连板股数量 |",
+                    f"| 最高板 | {overview.highest_board_stock} ({overview.highest_board_count}板) | 2板至最高板: {overview.boards_2_to_max} |",
                     f"| 两市成交额 | {overview.total_amount:.0f} 亿 | {self._describe_turnover(overview.total_amount)} |",
                 ]
             )
+            # 添加融资融券数据（如果有）
+            if overview.margin_total > 0:
+                lines.append(f"| 融资融券余额 | {overview.margin_total:.0f} 亿 | 沪{overview.margin_sh:.0f}/深{overview.margin_sz:.0f}/京{overview.margin_bj:.0f} |")
+            # 添加平均股价（如果有）
+            if overview.avg_stock_price > 0:
+                lines.append(f"| 平均股价 | {overview.avg_stock_price:.2f} 元 | 全市场算术平均 |")
         return "\n".join(lines)
 
     def build_market_light_snapshot(self, overview: MarketOverview) -> Dict[str, Any]:
@@ -1317,6 +1398,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             reasons.append(f"主要指数平均涨跌幅 {avg_change:+.2f}%")
         if overview.limit_up_count or overview.limit_down_count:
             reasons.append(f"涨跌停差 {overview.limit_up_count - overview.limit_down_count:+d}")
+        # 新增指标
+        if overview.median_change_pct != 0.0:
+            reasons.append(f"中位数涨跌幅 {overview.median_change_pct:+.2f}%")
+        if overview.break_count > 0:
+            reasons.append(f"炸板数 {overview.break_count}，炸板率 {overview.break_rate:.1f}%")
+        if overview.highest_board_count > 0:
+            reasons.append(f"最高板 {overview.highest_board_stock} ({overview.highest_board_count}板)")
         if not reasons and overview.total_amount:
             reasons.append(f"成交额 {overview.total_amount:.0f} 亿，{self._describe_turnover(overview.total_amount)}")
         if not reasons:

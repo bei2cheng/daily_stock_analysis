@@ -400,7 +400,32 @@ class BaseFetcher(ABC):
                 - flat_count: 平盘家数
                 - limit_up_count: 涨停家数
                 - limit_down_count: 跌停家数
-                - total_amount: 两市成交额
+                - limit_up_20pct_count: 20%涨停板数（科创板/创业板）
+                - break_count: 涨停炸板数
+                - break_rate: 炸板率(%)
+                - median_change_pct: 中位数涨跌幅(%)
+                - limit_up_down_ratio: 涨跌停比例
+                - lookback_10pct_count: 回头波大于10%数
+                - consecutive_boards_count: 连板数
+                - consecutive_boards_rate: 连板率(%)
+                - highest_board_stock: 最高板代表股
+                - highest_board_count: 最高板数
+                - boards_2_to_max: 2板至最高板数量
+                - total_amount: 两市成交额（亿元）
+                - avg_stock_price: 平均股价
+        """
+        return None
+
+    def get_margin_balance(self) -> Optional[Dict[str, Any]]:
+        """
+        获取融资融券余额
+
+        Returns:
+            Dict: 包含:
+                - sh: 上海融资融券余额（亿元）
+                - sz: 深圳融资融券余额（亿元）
+                - bj: 北京融资融券余额（亿元）
+                - total: 融资融券合计（亿元）
         """
         return None
 
@@ -2554,6 +2579,41 @@ class DataFetcherManager:
                 )
                 continue
         logger.warning("[MarketStats] component=market_stats action=complete status=empty purpose=%s", purpose)
+        return {}
+
+    def get_margin_balance(self) -> Dict[str, Any]:
+        """获取融资融券余额（自动切换数据源）"""
+        logger.info("[MarginBalance] component=margin_balance action=start")
+        for fetcher in self._fetchers:
+            started_at = time.monotonic()
+            try:
+                data = fetcher.get_margin_balance()
+                elapsed = time.monotonic() - started_at
+                if data:
+                    logger.info(
+                        "[MarginBalance] component=margin_balance action=provider_success "
+                        "provider=%s elapsed=%.2fs",
+                        fetcher.name,
+                        elapsed,
+                    )
+                    return data
+                logger.info(
+                    "[MarginBalance] component=margin_balance action=provider_empty "
+                    "provider=%s elapsed=%.2fs",
+                    fetcher.name,
+                    elapsed,
+                )
+            except Exception as e:
+                elapsed = time.monotonic() - started_at
+                logger.warning(
+                    "[MarginBalance] component=margin_balance action=provider_failed "
+                    "provider=%s elapsed=%.2fs error=%s",
+                    fetcher.name,
+                    elapsed,
+                    e,
+                )
+                continue
+        logger.warning("[MarginBalance] component=margin_balance action=complete status=empty")
         return {}
 
     def _run_with_timeout(

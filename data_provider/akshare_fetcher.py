@@ -1856,6 +1856,8 @@ class AkshareFetcher(BaseFetcher):
         """
         import akshare as ak
 
+        stats = None
+
         # 优先东财接口
         try:
             self._set_random_user_agent()
@@ -1874,11 +1876,12 @@ class AkshareFetcher(BaseFetcher):
                 elapsed,
             )
             if df is not None and not df.empty:
-                return self._calc_market_stats(df)
-            logger.warning(
-                "[MarketStats] component=market_stats provider=AkshareFetcher "
-                "api=ak.stock_zh_a_spot_em action=parse status=empty"
-            )
+                stats = self._calc_market_stats(df)
+            else:
+                logger.warning(
+                    "[MarketStats] component=market_stats provider=AkshareFetcher "
+                    "api=ak.stock_zh_a_spot_em action=parse status=empty"
+                )
         except Exception as e:
             logger.warning(
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
@@ -1887,35 +1890,178 @@ class AkshareFetcher(BaseFetcher):
             )
 
         # 东财失败后，尝试新浪接口
+        if stats is None:
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+
+                started_at = time.monotonic()
+                logger.info(
+                    "[MarketStats] component=market_stats provider=AkshareFetcher "
+                    "api=ak.stock_zh_a_spot action=request_start"
+                )
+                df = ak.stock_zh_a_spot()
+                elapsed = time.monotonic() - started_at
+                logger.info(
+                    "[MarketStats] component=market_stats provider=AkshareFetcher "
+                    "api=ak.stock_zh_a_spot action=request_complete elapsed=%.2fs",
+                    elapsed,
+                )
+                if df is not None and not df.empty:
+                    stats = self._calc_market_stats(df)
+                else:
+                    logger.warning(
+                        "[MarketStats] component=market_stats provider=AkshareFetcher "
+                        "api=ak.stock_zh_a_spot action=parse status=empty"
+                    )
+            except Exception as e:
+                logger.error(
+                    "[MarketStats] component=market_stats provider=AkshareFetcher "
+                    "api=ak.stock_zh_a_spot action=failed error=%s",
+                    e,
+                )
+
+        if stats is None:
+            return None
+
+        # 补充炸板数、连板数等数据（通过涨停池接口）
+        self._enrich_market_stats_with_limit_up_data(stats)
+
+        return stats
+
+    def _enrich_market_stats_with_limit_up_data(self, stats: Dict[str, Any]):
+        """通过涨停池接口补充炸板数、连板数等数据。"""
+        import akshare as ak
+
+        query_date = datetime.now().strftime('%Y%m%d')
+
+        # 1. 获取炸板池数据
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            df_break = ak.stock_zt_pool_zbgc_em(date=query_date)
+            if df_break is not None and not df_break.empty:
+                stats['break_count'] = len(df_break)
+                # 计算炸板率 = 炸板数 / (涨停数 + 炸板数)
+                total_limit_attempts = stats.get('limit_up_count', 0) + len(df_break)
+                if total_limit_attempts > 0:
+                    stats['break_rate'] = round(len(df_break) / total_limit_attempts * 100, 1)
+                else:
+                    stats['break_rate'] = 0.0
+            else:
+                stats['break_count'] = 0
+                stats['break_rate'] = 0.0
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取炸板池数据失败: {e}")
+            stats['break_count'] = 0
+            stats['break_rate'] = 0.0
+
+        # 2. 获取涨停池数据（连板数）
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            df_zt = ak.stock_zt_pool_em(date=query_date)
+            if df_zt is not None and not df_zt.empty:
+                # 连板数统计
+                if '连板数' in df_zt.columns:
+                    df_zt['连板数'] = pd.to_numeric(df_zt['连板数'], errors='coerce')
+                    consecutive_counts = df_zt['连板数'].dropna()
+                    stats['consecutive_boards_count'] = int((consecutive_counts >= 2).sum())
+                    stats['highest_board_count'] = int(consecutive_counts.max()) if not consecutive_counts.empty else 0
+                    # 最高板代表股
+                    if stats['highest_board_count'] >= 2:
+                        max_board_rows = df_zt[df_zt['连板数'] == stats['highest_board_count']]
+                        if not max_board_rows.empty:
+                            stats['highest_board_stock'] = str(max_board_rows.iloc[0].get('名称', '')).strip()
+                    # 2板至最高板数量
+                    stats['boards_2_to_max'] = int((consecutive_counts >= 2).sum())
+                    # 连板率 = 连板股数 / 涨停股数
+                    if stats['limit_up_count'] > 0:
+                        stats['consecutive_boards_rate'] = round(stats['consecutive_boards_count'] / stats['limit_up_count'] * 100, 1)
+                    else:
+                        stats['consecutive_boards_rate'] = 0.0
+                else:
+                    stats['consecutive_boards_count'] = 0
+                    stats['consecutive_boards_rate'] = 0.0
+                    stats['highest_board_count'] = 0
+                    stats['highest_board_stock'] = ""
+                    stats['boards_2_to_max'] = 0
+            else:
+                stats['consecutive_boards_count'] = 0
+                stats['consecutive_boards_rate'] = 0.0
+                stats['highest_board_count'] = 0
+                stats['highest_board_stock'] = ""
+                stats['boards_2_to_max'] = 0
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取涨停池数据失败: {e}")
+            stats['consecutive_boards_count'] = 0
+            stats['consecutive_boards_rate'] = 0.0
+            stats['highest_board_count'] = 0
+            stats['highest_board_stock'] = ""
+            stats['boards_2_to_max'] = 0
+
+    def get_margin_balance(self) -> Optional[Dict[str, Any]]:
+        """
+        获取融资融券余额
+
+        数据源：
+        1. 上海 (ak.stock_margin_sse) - 返回元，需转亿元
+        2. 深圳 (ak.stock_margin_szse) - 返回亿元
+        3. 北京 (ak.stock_margin_bse) - 返回万元，需转亿元
+        """
+        import akshare as ak
+
+        result = {
+            'sh': 0.0,
+            'sz': 0.0,
+            'bj': 0.0,
+            'total': 0.0,
+        }
+
+        # 上海融资融券 - 返回元，转亿元
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
 
-            started_at = time.monotonic()
-            logger.info(
-                "[MarketStats] component=market_stats provider=AkshareFetcher "
-                "api=ak.stock_zh_a_spot action=request_start"
-            )
-            df = ak.stock_zh_a_spot()
-            elapsed = time.monotonic() - started_at
-            logger.info(
-                "[MarketStats] component=market_stats provider=AkshareFetcher "
-                "api=ak.stock_zh_a_spot action=request_complete elapsed=%.2fs",
-                elapsed,
-            )
-            if df is not None and not df.empty:
-                return self._calc_market_stats(df)
-            logger.warning(
-                "[MarketStats] component=market_stats provider=AkshareFetcher "
-                "api=ak.stock_zh_a_spot action=parse status=empty"
-            )
+            end_date = datetime.now().strftime('%Y%m%d')
+            start_date = (datetime.now() - pd.Timedelta(days=30)).strftime('%Y%m%d')
+            df_sh = ak.stock_margin_sse(start_date=start_date, end_date=end_date)
+            if df_sh is not None and not df_sh.empty:
+                latest = df_sh.iloc[-1]
+                margin_col = '融资融券余额' if '融资融券余额' in df_sh.columns else None
+                if margin_col:
+                    result['sh'] = float(latest[margin_col]) / 1e8  # 元 -> 亿元
         except Exception as e:
-            logger.error(
-                "[MarketStats] component=market_stats provider=AkshareFetcher "
-                "api=ak.stock_zh_a_spot action=failed error=%s",
-                e,
-            )
+            logger.warning(f"[Akshare] 获取上海融资融券数据失败: {e}")
 
+        # 深圳融资融券 - 返回亿元
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            df_sz = ak.stock_margin_szse()
+            if df_sz is not None and not df_sz.empty:
+                latest = df_sz.iloc[-1]
+                result['sz'] = float(latest.get('融资融券余额', 0))  # 已经是亿元
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取深圳融资融券数据失败: {e}")
+
+        # 北京融资融券 - 返回万元，转亿元
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            df_bj = ak.stock_margin_bse()
+            if df_bj is not None and not df_bj.empty:
+                latest = df_bj.iloc[-1]
+                result['bj'] = float(latest.get('融资融券余额', 0)) / 1e4  # 万元 -> 亿元
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取北京融资融券数据失败: {e}")
+
+        result['total'] = result['sh'] + result['sz'] + result['bj']
+
+        if result['total'] > 0:
+            return result
         return None
 
     def _calc_market_stats(
@@ -1926,38 +2072,45 @@ class AkshareFetcher(BaseFetcher):
         import numpy as np
 
         df = df.copy()
-        
+
         # 1. 提取基础比对数据：最新价、昨收
         # 兼容不同接口返回的列名 sina/em efinance tushare xtdata
         code_col = next((c for c in ['代码', '股票代码', 'ts_code','stock_code'] if c in df.columns), None)
         name_col = next((c for c in ['名称', '股票名称','name','name'] if c in df.columns), None)
         close_col = next((c for c in ['最新价', '最新价', 'close','lastPrice'] if c in df.columns), None)
         pre_close_col = next((c for c in ['昨收', '昨日收盘', 'pre_close','lastClose'] if c in df.columns), None)
-        amount_col = next((c for c in ['成交额', '成交额', 'amount','amount'] if c in df.columns), None) 
-        
+        amount_col = next((c for c in ['成交额', '成交额', 'amount','amount'] if c in df.columns), None)
+        high_col = next((c for c in ['最高', '最高价', 'high'] if c in df.columns), None)
+        change_pct_col = next((c for c in ['涨跌幅', '涨跌幅', 'pct_chg', 'change_pct'] if c in df.columns), None)
+
         limit_up_count = 0
         limit_down_count = 0
+        limit_up_20pct_count = 0
         up_count = 0
         down_count = 0
         flat_count = 0
+        lookback_10pct_count = 0
+        change_pcts = []
+        total_price = 0.0
+        price_count = 0
 
         for code, name, current_price, pre_close, amount in zip(
             df[code_col], df[name_col], df[close_col], df[pre_close_col], df[amount_col]
         ):
-            
+
             # 停牌过滤 efinance 的停牌数据有时候会缺失价格显示为 '-'，em 显示为none
             if pd.isna(current_price) or pd.isna(pre_close) or current_price in ['-'] or pre_close in ['-'] or amount == 0:
                 continue
-            
+
             # em、efinance 为str 需要转换为float
             current_price = float(current_price)
             pre_close = float(pre_close)
-            
+
             # 获取去除前缀的纯数字代码
-            pure_code = normalize_stock_code(str(code)) 
+            pure_code = normalize_stock_code(str(code))
 
             # A. 确定每只股票的涨跌幅比例 (使用纯数字代码判断)
-            if is_bse_code(pure_code): 
+            if is_bse_code(pure_code):
                 ratio = 0.30
             elif is_kc_cy_stock(pure_code): #pure_code.startswith(('688', '30')):
                 ratio = 0.20
@@ -1980,6 +2133,8 @@ class AkshareFetcher(BaseFetcher):
 
                 if is_limit_up:
                     limit_up_count += 1
+                    if ratio == 0.20:
+                        limit_up_20pct_count += 1
                 if is_limit_down:
                     limit_down_count += 1
 
@@ -1989,7 +2144,35 @@ class AkshareFetcher(BaseFetcher):
                     down_count += 1
                 else:
                     flat_count += 1
-                
+
+                # 计算涨跌幅用于中位数
+                if pre_close > 0:
+                    pct = (current_price - pre_close) / pre_close * 100
+                    change_pcts.append(pct)
+
+                # 平均股价
+                if current_price > 0:
+                    total_price += current_price
+                    price_count += 1
+
+        # 回头波大于10%（从最高价回落超过10%）
+        if high_col and high_col in df.columns:
+            for high_price, current_price, pre_close in zip(
+                df[high_col], df[close_col], df[pre_close_col]
+            ):
+                if pd.isna(high_price) or pd.isna(current_price) or pd.isna(pre_close):
+                    continue
+                try:
+                    high_price = float(high_price)
+                    current_price = float(current_price)
+                    pre_close = float(pre_close)
+                    if pre_close > 0 and high_price > pre_close * 1.10 and current_price < high_price:
+                        drop_pct = (high_price - current_price) / pre_close * 100
+                        if drop_pct > 10:
+                            lookback_10pct_count += 1
+                except (ValueError, TypeError):
+                    continue
+
         # 统计数量
         stats = {
             'up_count': up_count,
@@ -1997,14 +2180,33 @@ class AkshareFetcher(BaseFetcher):
             'flat_count': flat_count,
             'limit_up_count': limit_up_count,
             'limit_down_count': limit_down_count,
+            'limit_up_20pct_count': limit_up_20pct_count,
             'total_amount': 0.0,
+            'median_change_pct': 0.0,
+            'limit_up_down_ratio': 0.0,
+            'lookback_10pct_count': lookback_10pct_count,
+            'avg_stock_price': 0.0,
         }
-        
+
+        # 中位数涨跌幅
+        if change_pcts:
+            stats['median_change_pct'] = float(np.median(change_pcts))
+
+        # 涨跌停比例
+        if limit_down_count > 0:
+            stats['limit_up_down_ratio'] = round(limit_up_count / limit_down_count, 2)
+        elif limit_up_count > 0:
+            stats['limit_up_down_ratio'] = float('inf')
+
+        # 平均股价
+        if price_count > 0:
+            stats['avg_stock_price'] = round(total_price / price_count, 2)
+
         # 成交额统计
         if amount_col and amount_col in df.columns:
             df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
             stats['total_amount'] = (df[amount_col].sum() / 1e8)
-            
+
         return stats
 
     def get_sector_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
