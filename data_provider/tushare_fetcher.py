@@ -204,12 +204,13 @@ class TushareFetcher(BaseFetcher):
         端点，便于在网络无法直达 ``api.tushare.pro`` 时切换镜像/网关。
         留空或不设置则保持官方默认地址，行为与历史版本完全一致。
         """
+        timeout = int(os.getenv("TUSHARE_TIMEOUT_SEC", "30"))
         api_url = _resolve_tushare_http_url()
         if api_url:
             logger.info("Tushare 使用自定义接入地址: %s", api_url)
-            client = _TushareHttpClient(token=token, api_url=api_url)
+            client = _TushareHttpClient(token=token, timeout=timeout, api_url=api_url)
         else:
-            client = _TushareHttpClient(token=token)
+            client = _TushareHttpClient(token=token, timeout=timeout)
         logger.debug("Tushare API client configured for direct HTTP calls")
         return client
 
