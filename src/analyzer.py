@@ -1913,7 +1913,7 @@ class GeminiAnalyzer:
 
 ## 输出格式：决策仪表盘 JSON
 
-请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
+你的完整回复必须是且仅是一个合法的 JSON 对象，不得在 JSON 前后包含任何说明、前言或总结。请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
 
 ```json
 {
@@ -2101,7 +2101,7 @@ class GeminiAnalyzer:
 
 ## 输出格式：决策仪表盘 JSON
 
-请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
+你的完整回复必须是且仅是一个合法的 JSON 对象，不得在 JSON 前后包含任何说明、前言或总结。请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
 
 ```json
 {
@@ -2394,6 +2394,7 @@ class GeminiAnalyzer:
 
 ## Output Language (highest priority)
 
+- Your entire response must be a single valid JSON object — no text before or after the JSON.
 - Keep all JSON keys unchanged.
 - `decision_type` must remain `buy|hold|sell`.
 - All human-readable JSON values must be written in English.
@@ -2405,6 +2406,7 @@ class GeminiAnalyzer:
 
 ## Output Language (highest priority)
 
+- Your entire response must be a single valid JSON object — no text before or after the JSON.
 - Keep all JSON keys unchanged.
 - `decision_type` must remain `buy|hold|sell`.
 - All human-readable JSON values must be written in Korean (한국어).
@@ -2415,6 +2417,7 @@ class GeminiAnalyzer:
 
 ## 输出语言（最高优先级）
 
+- 完整回复必须是且仅是一个合法的 JSON 对象，JSON 前后不得包含任何文字。
 - 所有 JSON 键名保持不变。
 - `decision_type` 必须保持为 `buy|hold|sell`。
 - 所有面向用户的人类可读文本值必须使用中文。
@@ -3542,6 +3545,89 @@ class GeminiAnalyzer:
                     return (content, actual_model, usage)
                 raise ValueError("LLM returned empty response")
 
+            except ValueError as _empty_resp_exc:
+                _empty_msg = str(_empty_resp_exc)
+                if _empty_msg != "LLM returned empty response":
+                    raise
+                _max_empty_retries = getattr(config, 'litellm_empty_response_retries', 2) or 0
+                _backoff_base = getattr(config, 'litellm_empty_response_backoff_base', 2.0) or 2.0
+                _retried_empty = False
+                for _retry_idx in range(1, _max_empty_retries + 1):
+                    _backoff = _backoff_base * (2 ** (_retry_idx - 1))
+                    logger.warning(
+                        "[LiteLLM] %s returned empty response, retrying in %.1fs (%d/%d)",
+                        model, _backoff, _retry_idx, _max_empty_retries,
+                    )
+                    time.sleep(_backoff)
+                    try:
+                        response = call_litellm_with_param_recovery(
+                            lambda kwargs: self._dispatch_litellm_completion(
+                                model,
+                                kwargs,
+                                config=config,
+                                use_channel_router=use_channel_router,
+                                router_model_names=router_model_names,
+                            ),
+                            model=model,
+                            call_kwargs=call_kwargs,
+                            model_list=recovery_model_list,
+                            logger=logger,
+                        )
+                        response_model, response_provider = self._resolve_response_model_provider(
+                            response,
+                            fallback_provider=usage_provider,
+                            configured_model=model,
+                            model_list=recovery_model_list,
+                        )
+                        actual_model = response_model or model
+                        if response_model:
+                            last_model = actual_model
+                        if response_provider:
+                            last_provider = response_provider
+                        content = self._extract_completion_text(response)
+                        if content:
+                            usage_messages = None if audit_context is not None else call_kwargs["messages"]
+                            usage = self._normalize_usage(
+                                extract_usage_payload(response),
+                                model=response_model or usage_model or model,
+                                provider=response_provider or usage_provider,
+                                messages=usage_messages,
+                            )
+                            if response_provider or usage_provider:
+                                usage["provider"] = response_provider or usage_provider
+                            if audit_context is not None:
+                                usage = _attach_usage_audit(usage, call_kwargs["messages"])
+                            if response_model:
+                                usage.setdefault("response_model", response_model)
+                            if response_provider or usage_provider:
+                                usage.setdefault("provider", response_provider or usage_provider)
+                            last_response_text = content
+                            last_model = actual_model
+                            if response_provider:
+                                last_provider = response_provider
+                            last_usage = usage
+                            if response_validator is not None:
+                                response_validator(content)
+                            logger.info(
+                                "[LiteLLM] %s empty-response retry %d succeeded",
+                                model, _retry_idx,
+                            )
+                            return (content, actual_model, usage)
+                        logger.warning(
+                            "[LiteLLM] %s empty-response retry %d still returned empty",
+                            model, _retry_idx,
+                        )
+                    except Exception as _retry_exc:
+                        _retry_safe = self._sanitize_litellm_exception_text(_retry_exc, config=config, model=model)
+                        logger.warning(
+                            "[LiteLLM] %s empty-response retry %d failed: %s",
+                            model, _retry_idx, _retry_safe,
+                        )
+                safe_error = self._sanitize_litellm_exception_text(_empty_resp_exc, config=config, model=model)
+                logger.warning("[LiteLLM] %s failed after %d empty-response retries: %s", model, _max_empty_retries, safe_error)
+                last_error = RuntimeError(f"ValueError: {safe_error}")
+                _retried_empty = True
+
             except Exception as e:
                 if uses_router:
                     router_model, router_provider = self._resolve_router_failure_identity(
@@ -3556,6 +3642,9 @@ class GeminiAnalyzer:
                 safe_error = self._sanitize_litellm_exception_text(e, config=config, model=model)
                 logger.warning("[LiteLLM] %s failed: %s", model, safe_error)
                 last_error = RuntimeError(f"{type(e).__name__}: {safe_error}")
+                continue
+
+            if last_error is not None:
                 continue
 
         raise _AllModelsFailedError(
@@ -4701,16 +4790,45 @@ class GeminiAnalyzer:
         )
         fenced_matches = list(fence_pattern.finditer(text))
         if len(fenced_matches) > 1:
+            for fm in fenced_matches:
+                fence_lang = (fm.group("lang") or "").strip().lower()
+                if fence_lang not in {"", "json"}:
+                    continue
+                candidate = fm.group("body").strip()
+                if not candidate:
+                    continue
+                try:
+                    data = self._load_analysis_json_candidate(candidate)
+                    if isinstance(data, dict):
+                        logger.info(
+                            "[JSON] Resolved ambiguous fenced blocks: selected %s-tagged block with valid dict (%d keys)",
+                            fence_lang or "plain",
+                            len(data),
+                        )
+                        return candidate, data
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
             raise ValueError("ambiguous_json")
         if len(fenced_matches) == 1:
             match = fenced_matches[0]
             outside = (text[:match.start()] + text[match.end():]).strip()
-            if outside:
-                raise ValueError("ambiguous_json")
             fence_lang = (match.group("lang") or "").strip().lower()
             if fence_lang not in {"", "json"}:
                 raise ValueError("ambiguous_json")
             json_str = match.group("body").strip()
+            try:
+                data = self._load_analysis_json_candidate(json_str)
+                if isinstance(data, dict):
+                    if outside:
+                        logger.info(
+                            "[JSON] Fenced block has outside text, but block contains valid dict (%d keys); using block",
+                            len(data),
+                        )
+                    return json_str, data
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            if outside:
+                raise ValueError("ambiguous_json")
             data = self._load_analysis_json_candidate(json_str)
             return json_str, data
         if "```" in text:
@@ -4943,6 +5061,67 @@ class GeminiAnalyzer:
         
         return json_str
 
+    def _try_lenient_json_extraction(self, text: str) -> Optional[Dict[str, Any]]:
+        """Lenient JSON extraction for ambiguous LLM responses.
+
+        Tries multiple strategies when strict extraction fails:
+        1. Find the largest brace-delimited substring that parses as a dict
+        2. Use json_repair on the full text
+        3. Try each fenced code block independently
+        """
+        if not text or not text.strip():
+            return None
+
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start >= 0 and brace_end > brace_start:
+            snippet = text[brace_start:brace_end + 1]
+            try:
+                data = json.loads(snippet)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+            try:
+                from json_repair import repair_json
+                repaired = repair_json(snippet, return_objects=True)
+                if isinstance(repaired, dict):
+                    return repaired
+            except Exception:
+                pass
+
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(text, return_objects=True)
+            if isinstance(repaired, dict):
+                return repaired
+        except Exception:
+            pass
+
+        fence_pattern = re.compile(
+            r"```[ \t]*(?:json)?[ \t]*\n?(.*?)```",
+            flags=re.DOTALL,
+        )
+        for match in fence_pattern.finditer(text):
+            candidate = match.group(1).strip()
+            if not candidate:
+                continue
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+            try:
+                from json_repair import repair_json
+                repaired = repair_json(candidate, return_objects=True)
+                if isinstance(repaired, dict):
+                    return repaired
+            except Exception:
+                pass
+
+        return None
+
     def _validate_json_response(self, text: str) -> None:
         """Validate that *text* contains one parser-compatible JSON object.
 
@@ -4960,6 +5139,14 @@ class GeminiAnalyzer:
         except ValueError as exc:
             reason = str(exc) or "invalid_json"
             if reason == "ambiguous_json":
+                lenient_data = self._try_lenient_json_extraction(text)
+                if lenient_data is not None:
+                    try:
+                        self._validate_analysis_minimal_contract(lenient_data)
+                        logger.info("[JSON] ambiguous_json resolved via lenient extraction; skipping strict validation error")
+                        return
+                    except Exception:
+                        pass
                 message = "JSON source is ambiguous"
             else:
                 message = "No unique JSON object found in LLM response"

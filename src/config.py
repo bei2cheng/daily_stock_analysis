@@ -906,6 +906,8 @@ class Config:
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.1-pro-preview)
     litellm_model: str = ""  # Primary model; must include provider prefix when set explicitly
     litellm_fallback_models: List[str] = field(default_factory=list)  # Cross-model fallback list
+    litellm_empty_response_retries: int = 2  # Per-model retries when LLM returns empty response
+    litellm_empty_response_backoff_base: float = 2.0  # Base seconds for exponential backoff on empty response
 
     # Unified temperature for all LLM calls (LLM_TEMPERATURE); legacy per-provider temps are fallback only
     llm_temperature: float = 0.7
@@ -1521,6 +1523,15 @@ class Config:
         else:
             litellm_fallback_models = []
 
+        litellm_empty_response_retries = parse_env_int(
+            os.getenv('LITELLM_EMPTY_RESPONSE_RETRIES'), 2,
+            field_name='LITELLM_EMPTY_RESPONSE_RETRIES', minimum=0, maximum=5,
+        )
+        litellm_empty_response_backoff_base = parse_env_float(
+            os.getenv('LITELLM_EMPTY_RESPONSE_BACKOFF_BASE'), 2.0,
+            field_name='LITELLM_EMPTY_RESPONSE_BACKOFF_BASE', minimum=0.5, maximum=30.0,
+        )
+
         # === LLM Channels + YAML config ===
         litellm_config_path = os.getenv('LITELLM_CONFIG', '').strip() or None
         llm_models_source = "legacy_env"
@@ -1813,6 +1824,8 @@ class Config:
             opencode_cli_model=opencode_cli_model,
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
+            litellm_empty_response_retries=litellm_empty_response_retries,
+            litellm_empty_response_backoff_base=litellm_empty_response_backoff_base,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
             litellm_config_path=litellm_config_path,
             llm_models_source=llm_models_source,
